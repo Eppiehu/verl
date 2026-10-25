@@ -175,6 +175,9 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
     # lazy init FSDP model
     _lazy_init(model, model)
     assert model._is_root, "Only support root model offloading to CPU"
+    # torch-npu pins the CPU destination for non-blocking D2H copies. Avoid
+    # exhausting pinned host memory when multiple ranks offload their shards.
+    non_blocking = get_device_name() != "npu"
     for handle in model._all_handles:
         if handle._offload_params:
             continue
@@ -184,7 +187,7 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
             and id(flat_param.data) != id(flat_param._local_shard)
             and flat_param.data.size() == flat_param._local_shard.size()
         )
-        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+        handle.flat_param_to(torch.device("cpu"), non_blocking=non_blocking)
         # the following still keeps id(._local_shard) != id(.data)
         flat_param._local_shard = flat_param.data
         assert id(flat_param._local_shard) != id(flat_param.data)
@@ -232,12 +235,14 @@ def load_fsdp2_model_to_gpu(model):
 def offload_fsdp_optimizer(optimizer):
     if not optimizer.state:
         return
+    # Optimizer states can exhaust the same NPU pinned host allocator as model shards.
+    non_blocking = get_device_name() != "npu"
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             state = optimizer.state[param]
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
-                    state[key] = value.to("cpu", non_blocking=True)
+                    state[key] = value.to("cpu", non_blocking=non_blocking)
 
 
 @torch.no_grad()
