@@ -59,12 +59,14 @@ def compute_tail_aware_logit_gradient(
     tail_is_active = raw_student_tail > tail_mass_eps
     active_outside_scale = teacher_topk_mass - teacher_tail * student_topk_mass / student_tail
     outside_scale = torch.where(tail_is_active, active_outside_scale, teacher_topk_mass)
-    grad_input = student_probs * outside_scale.unsqueeze(-1)
 
-    source_topk_probs = torch.gather(student_probs, dim=-1, index=teacher_topk_indices)
+    # Select the scale before multiplying. Applying the (potentially large) tail
+    # scale to a selected token and then cancelling it can erase its FP32 gradient.
+    # A real local ID may coincide with a dummy index from a different TP shard.
+    selected = torch.zeros_like(student_probs, dtype=torch.bool)
+    selected.scatter_reduce_(-1, teacher_topk_indices, teacher_topk_mask, reduce="amax")
     topk_scale = teacher_topk_mass + torch.where(tail_is_active, teacher_tail, 0.0)
-    correction = (
-        (topk_scale - outside_scale).unsqueeze(-1) * source_topk_probs - teacher_topk_probs
-    ) * teacher_topk_mask.to(student_probs.dtype)
-    grad_input.scatter_add_(dim=-1, index=teacher_topk_indices, src=correction)
+    grad_input = torch.where(selected, topk_scale.unsqueeze(-1), outside_scale.unsqueeze(-1))
+    grad_input.mul_(student_probs)
+    grad_input.scatter_add_(-1, teacher_topk_indices, -teacher_topk_probs.masked_fill(~teacher_topk_mask, 0.0))
     return grad_input
